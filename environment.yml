@@ -1,4 +1,4 @@
-name: openfe_env
+name: openfe_dev
 channels:
   - conda-forge
 dependencies:

@@ -985,6 +985,12 @@ class RelativeHybridTopologyProtocolUnit(gufe.ProtocolUnit):
             softcore_LJ_v2 = True
         elif alchem_settings.softcore_LJ.lower() == "beutler":
             softcore_LJ_v2 = False
+
+        if 'garnet.xml' in forcefield_settings.forcefields[0]:
+            use_custom_vdw = True
+        else: 
+            use_custom_vdw = False
+
         # b. Get hybrid topology factory
         hybrid_factory = _rfe_utils.relative.HybridTopologyFactory(
             stateA_system,
@@ -1000,6 +1006,7 @@ class RelativeHybridTopologyProtocolUnit(gufe.ProtocolUnit):
             softcore_LJ_v2=softcore_LJ_v2,
             softcore_LJ_v2_alpha=alchem_settings.softcore_alpha,
             interpolate_old_and_new_14s=alchem_settings.turn_off_core_unique_exceptions,
+            use_custom_vdw=use_custom_vdw
         )
 
         # 4. Create lambda schedule

@@ -4,3 +4,6 @@ from . import (
     relative,
     topologyhelpers,
 )
+from .relative import (
+    HybridTopologyFactory,
+)

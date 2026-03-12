@@ -90,7 +90,9 @@ class HybridTopologyFactory:
                  softcore_alpha=0.5,
                  softcore_LJ_v2=True,
                  softcore_LJ_v2_alpha=0.85,
-                 interpolate_old_and_new_14s=False):
+                 interpolate_old_and_new_14s=False,
+                 use_custom_vdw=False
+                 ): 
         """
         Initialize the Hybrid topology factory.
 
@@ -128,6 +130,9 @@ class HybridTopologyFactory:
             Whether to turn off interactions for new exceptions (not just
             1,4s) at lambda = 0 and old exceptions at lambda = 1; if False,
             they are present in the nonbonded force.
+        use_custom_vdw : bool, default False
+            Whether to use a custom potential (currently the double exponential potential) 
+            to describe vdW interactions instead of using the regular LJ potential. 
         """
 
         # Assign system positions and force
@@ -146,6 +151,8 @@ class HybridTopologyFactory:
         # Other options
         self._use_dispersion_correction = use_dispersion_correction
         self._interpolate_14s = interpolate_old_and_new_14s
+        self._use_custom_vdw = use_custom_vdw
+        print(f"INFO: Running with use_custom_vdw={self._use_custom_vdw}")
 
         # Sofcore options
         self._softcore_alpha = softcore_alpha
@@ -181,6 +188,16 @@ class HybridTopologyFactory:
         self._new_system_exceptions = self._generate_dict_from_exceptions(
             self._new_system_forces['NonbondedForce'])
 
+        # We are currently not using the exclusions from the CustomNonbondedForce;
+        # all exclusions are set based on where there are exceptions in the NonbondedForce. 
+        # So the CustomNonbondedForce will have exclusions 
+        # where the NonbondedForce has exceptions, which is set up in 
+        # self._handle_hybrid_exceptions() and self._handle_original_exceptions()
+        self._old_system_exceptions_custom = self._generate_dict_from_exceptions(
+            self._old_system_forces['CustomNonbondedForce'])
+        self._new_system_exceptions_custom = self._generate_dict_from_exceptions(
+            self._new_system_forces['CustomNonbondedForce'])
+        
         # check for exceptions clashes between unique and env atoms
         self._validate_disjoint_sets()
 
@@ -218,11 +235,23 @@ class HybridTopologyFactory:
         # add cmap terms if possible
         self._handle_cmap_torsion_force()
 
+        # handle nonbonded forces
         if has_nonbonded_force:
             self._handle_nonbonded()
+
+            # if there are exceptions in old or new system 
+            # set up interpolation of exceptions for unique atoms
             if not (len(self._old_system_exceptions.keys()) == 0 and
                     len(self._new_system_exceptions.keys()) == 0):
-                self._handle_old_new_exceptions()
+                
+                # with our custom potential, we only need interpolation
+                # for interactions involving electrostatics
+                if self._interpolate_14s and self._use_custom_vdw:
+                    self._interpolate_electrostatic_exceptions()
+
+                # for standard openfe setup, interpolate electrostatics and vdw
+                if self._use_custom_vdw==False:
+                    self._handle_old_new_exceptions()
 
         # Get positions for the hybrid
         self._hybrid_positions = self._compute_hybrid_positions()
@@ -471,7 +500,7 @@ class HybridTopologyFactory:
         def _check_unknown_forces(forces, system_name):
             # TODO: double check that CMMotionRemover is ok being here
             known_forces = {'HarmonicBondForce', 'HarmonicAngleForce',
-                            'PeriodicTorsionForce', 'NonbondedForce',
+                            'PeriodicTorsionForce', 'NonbondedForce','CustomNonbondedForce',
                             'MonteCarloBarostat', 'CMMotionRemover', 'CMAPTorsionForce'}
 
             force_names = forces.keys()
@@ -492,7 +521,7 @@ class HybridTopologyFactory:
         _check_unknown_forces(self._new_system_forces, 'new')
 
         # TODO: check if this is actually used much, otherwise ditch it
-        # Get and store the nonbonded method from the system:
+        # Get and store the nonbonded method from the system
         self._nonbonded_method = self._old_system_forces['NonbondedForce'].getNonbondedMethod()
 
     def _add_particles(self):
@@ -616,14 +645,27 @@ class HybridTopologyFactory:
         exceptions_dict : dict
             Dictionary of exceptions
         """
+        
+        force_name = force.getName()
         exceptions_dict = {}
 
-        for exception_index in range(force.getNumExceptions()):
-            [index1, index2, chargeProd, sigma, epsilon] = force.getExceptionParameters(exception_index)
-            exceptions_dict[(index1, index2)] = [chargeProd, sigma, epsilon]
+        if force_name == 'NonbondedForce':
+        
+            for exception_index in range(force.getNumExceptions()):
+                [index1, index2, chargeProd, sigma, epsilon] = force.getExceptionParameters(exception_index)
+                exceptions_dict[(index1, index2)] = [chargeProd, sigma, epsilon]
 
+        elif force_name == 'CustomNonbondedForce': 
+
+            for exception_index in range(force.getNumExclusions()):
+                [index1, index2] = force.getExclusionParticles(exception_index)
+                exceptions_dict[(index1, index2)] = []
+
+        else:
+            raise ValueError(f"Force type {force_name} not recognised")
+        
         return exceptions_dict
-
+        
     def _validate_disjoint_sets(self):
         """
         Conduct a sanity check to make sure that the hybrid maps of the old
@@ -961,10 +1003,11 @@ class HybridTopologyFactory:
         # interpolation
         sterics_addition = "epsilon = (1-lambda_sterics)*epsilonA + lambda_sterics*epsilonB;"
         # effective softcore distance for sterics
-        sterics_addition += "reff_sterics = sigma*((softcore_alpha*lambda_alpha + (r/sigma)^6))^(1/6);"
+        sterics_addition += "reff_sterics = sigma*((softcore_alpha*lambda_alpha + (r/sigma)^6))^(1/6);" # only relevant for v2=False
         sterics_addition += "sigma = (1-lambda_sterics)*sigmaA + lambda_sterics*sigmaB;"
 
         sterics_addition += "lambda_alpha = new_interaction*(1-lambda_sterics_insert) + old_interaction*lambda_sterics_delete;"
+        
         sterics_addition += "lambda_sterics = core_interaction*lambda_sterics_core + new_interaction*lambda_sterics_insert + old_interaction*lambda_sterics_delete;"
         sterics_addition += "core_interaction = delta(unique_old1+unique_old2+unique_new1+unique_new2);new_interaction = max(unique_new1, unique_new2);old_interaction = max(unique_old1, unique_old2);"
 
@@ -974,6 +1017,12 @@ class HybridTopologyFactory:
     def _nonbonded_custom_mixing_rules():
         """
         Mixing rules for the custom nonbonded force.
+
+        Every particle will have stateA and stateB parametes. If the particle
+        belongs to the environment, the parameters would be the same in stateA
+        and stateB. For unique old atoms, only stateA parameters are relevant, 
+        and stateB parameters would be 0. Opposite for unique new atoms. For
+        core atoms, sigma and epsilon for both stateA and stateB should be non-zero.
 
         Returns
         -------
@@ -1028,39 +1077,132 @@ class HybridTopologyFactory:
             errmsg = "This nonbonded method is not supported."
             raise NotImplementedError(errmsg)
 
+    @staticmethod
+    def _add_custom_vdw_potential():
+        """
+        Define a custom potential to describe van der Waals interactions. 
+        This function currently defines a double exponential potential, but 
+        could be modified to use other functional forms.
+        
+        NOTE: Have not updated the name of the alpha parameter in this function, 
+        since the function is currently not used.
+        """
+
+        # Create an OpenMM custom nonbonded force 
+        # We here define the double exponential potential
+        nonbonded_vdw_energy = "epsilon*(((beta*exp(alpha))/(alpha-beta))*exp(-alpha*(r/((2^(1/6))*(sigma))))-((alpha*exp(beta))/(alpha-beta))*exp(-beta*(r/((2^(1/6))*(sigma))))); sigma=(sigma1+sigma2)/2; epsilon=sqrt(epsilon1*epsilon2);"
+        nonbonded_vdw_force = openmm.CustomNonbondedForce(nonbonded_vdw_energy)
+
+        # Define global and local parameters of custom force
+        nonbonded_vdw_force.addGlobalParameter("alpha", 12.159626) 
+        nonbonded_vdw_force.addGlobalParameter("beta", 4.326311) 
+        nonbonded_vdw_force.addPerParticleParameter("sigma")
+        nonbonded_vdw_force.addPerParticleParameter("epsilon")
+
+        return nonbonded_vdw_force
+    
+    @staticmethod
+    def _add_custom_vdw_softcore():
+        """
+        Add a custom soft-core potential, which for Garnet simulations
+        needs to be the double exponential soft-core potential. 
+
+        This function defines the double exponential soft-core potential
+        and specifies how force field parameters should be (1) mixed for interacting particles 
+        and (2) interpolated between lambda states after mixing. 
+
+        This function does what _nonbonded_custom, _nonbonded_custom_sterics_common() and
+        _nonbonded_custom_mixing_rules() do in a single function. 
+        """
+
+        # define potential energy
+        de_soft_energy = "epsilon*(((beta_s*exp(alpha_s))/(alpha_s-beta_s))*exp(-alpha_s*(r/((2^(1/6))*(sigma))))-((alpha_s*exp(beta_s))/(alpha_s-beta_s))*exp(-beta_s*(r/((2^(1/6))*(sigma)))));"
+
+        # alpha and beta modified for lambda_a_b not 1 to soften potential at small r
+        de_soft_energy += "alpha_s = (1.1 + lambda_a_b * (alpha_de - 1.1));"
+        de_soft_energy += "beta_s = (1 + lambda_a_b * (beta_de - 1));"
+
+        # interpolate epsilon and sigmas
+        # interpolate epsilon
+        sterics_addition = "epsilon = (1-lambda_sterics)*epsilonA + lambda_sterics*epsilonB;"
+        # interpolate sigma
+        sterics_addition += "sigma = (1-lambda_sterics)*sigmaA + lambda_sterics*sigmaB;"
+
+        # set lambda depending on interaction type
+        # lambda_sterics is used to scale epsilon and sigma 
+        sterics_addition += "lambda_sterics = core_interaction*lambda_sterics_core + new_interaction*lambda_sterics_insert + old_interaction*lambda_sterics_delete;"
+        # lambda_a_b is used to adjust alpha and beta of the DE potential to soften core at small r values
+        sterics_addition += "lambda_a_b = new_interaction*(lambda_sterics_insert) + old_interaction*(1-lambda_sterics_delete) + core_interaction;" 
+        # determine interaction type
+        sterics_addition += "core_interaction = delta(unique_old1+unique_old2+unique_new1+unique_new2); new_interaction = max(unique_new1, unique_new2); old_interaction = max(unique_old1, unique_old2);"
+
+        # define mixing rules
+        # mixing rule for epsilon
+        sterics_mixing_rules = "epsilonA = sqrt(epsilonA1*epsilonA2);"
+        # mixing rule for epsilon
+        sterics_mixing_rules += "epsilonB = sqrt(epsilonB1*epsilonB2);"
+        # mixing rule for sigma
+        sterics_mixing_rules += "sigmaA = 0.5*(sigmaA1 + sigmaA2);"
+        # mixing rule for sigma
+        sterics_mixing_rules += "sigmaB = 0.5*(sigmaB1 + sigmaB2);"
+
+        # get full string with energy function definitions
+        de_soft_energy_full = de_soft_energy + sterics_addition + sterics_mixing_rules
+
+        return de_soft_energy_full
+
+    @staticmethod
+    def _add_custom_vdw_softcore_params(custom_softcore_force):
+
+        # Add global parameters
+        custom_softcore_force.addGlobalParameter("alpha_de", 12.159626) 
+        custom_softcore_force.addGlobalParameter("beta_de", 4.326311) 
+
+        # Add local parameters
+        # DE sigma initial
+        custom_softcore_force.addPerParticleParameter("sigmaA")
+        # DE epsilon initial
+        custom_softcore_force.addPerParticleParameter("epsilonA")
+        # DE sigma final
+        custom_softcore_force.addPerParticleParameter("sigmaB")
+        # DE epsilon final
+        custom_softcore_force.addPerParticleParameter("epsilonB")
+        # 1 = hybrid old atom, 0 otherwise
+        custom_softcore_force.addPerParticleParameter("unique_old")
+        # 1 = hybrid new atom, 0 otherwise
+        custom_softcore_force.addPerParticleParameter("unique_new")
+
+        return custom_softcore_force
+        
     def _add_nonbonded_force_terms(self):
         """
         Add the nonbonded force terms to the hybrid system. Note that as with
         the other forces, this method does not add any interactions. It only
         sets up the forces.
-
-        Notes
-        -----
-        * User defined functions have been removed for now.
-        * Argument `add_custom_sterics_force` (default True) has been removed
-          for now.
-
-        TODO
-        ----
-        * Move nonbonded_method defn here to avoid just setting it globally
-          and polluting `self`.
         """
-        # Add a regular nonbonded force for all interactions that are not
-        # changing.
+        
+        print(f"Setting up forces with _use_custom_vdw = {self._use_custom_vdw}")
+
+        # Add a regular OpenMM nonbonded force for all interactions that are not changing
+        # Can be used to handle either vdW and electrostatic interactions for non-changing atoms or 
+        # only electrostatic intractions (when epsilon=0) for non-changing atoms
         standard_nonbonded_force = openmm.NonbondedForce()
         self._hybrid_system.addForce(standard_nonbonded_force)
         self._hybrid_system_forces['standard_nonbonded_force'] = standard_nonbonded_force
 
-        # Create a CustomNonbondedForce to handle alchemically interpolated
-        # nonbonded parameters.
-        # Select functional form based on nonbonded method.
-        # TODO: check _nonbonded_custom_ewald and _nonbonded_custom_cutoff
-        # since they take arguments that are never used...
+        # Get cutoff distance
         r_cutoff = self._old_system_forces['NonbondedForce'].getCutoffDistance()
-        sterics_energy_expression = self._nonbonded_custom(self._softcore_LJ_v2)
+
+        # Check cutoff distance is the same for the NonbondedForce and CustomNonbondedForce
+        if self._use_custom_vdw:
+            r_cutoff_nb_custom = self._old_system_forces['CustomNonbondedForce'].getCutoffDistance()
+            if r_cutoff != r_cutoff_nb_custom:
+                raise NotImplementedError('CutoffDistance must be the same for NonbondedForce and CustomNonbondedForce')
+
+        # Set parameters of NonbondedMethod (use the same parameters as in old_system)
+        # self._nonbonded_method is defined in the system setup 
         if self._nonbonded_method in [openmm.NonbondedForce.NoCutoff]:
-            sterics_energy_expression = self._nonbonded_custom(
-                self._softcore_LJ_v2)
+            pass
         elif self._nonbonded_method in [openmm.NonbondedForce.CutoffPeriodic,
                                         openmm.NonbondedForce.CutoffNonPeriodic]:
             epsilon_solvent = self._old_system_forces['NonbondedForce'].getReactionFieldDielectric()
@@ -1077,67 +1219,89 @@ class HybridTopologyFactory:
         else:
             errmsg = f"Nonbonded method {self._nonbonded_method} not supported"
             raise ValueError(errmsg)
-
+        
+        # Set NonBonded method for standard forces 
         standard_nonbonded_force.setNonbondedMethod(self._nonbonded_method)
 
-        sterics_energy_expression += self._nonbonded_custom_sterics_common()
+        # Define soft-core potential as double exponential soft-core potential
+        # or use soft-core potentials defined in original OpenFE code (Gapsys, Beutler)
+        if self._use_custom_vdw:
+            total_sterics_energy = self._add_custom_vdw_softcore() 
+            custom_nonbonded_method = self._old_system_forces['CustomNonbondedForce'].getNonbondedMethod()
+        else:
+            sterics_energy_expression = self._nonbonded_custom(self._softcore_LJ_v2) 
+            sterics_energy_expression += self._nonbonded_custom_sterics_common()
+            sterics_mixing_rules = self._nonbonded_custom_mixing_rules()   
+            custom_nonbonded_method = self._translate_nonbonded_method_to_custom(self._nonbonded_method) 
+            total_sterics_energy = "U_sterics;" + sterics_energy_expression + sterics_mixing_rules
 
-        sterics_mixing_rules = self._nonbonded_custom_mixing_rules()
-
-        custom_nonbonded_method = self._translate_nonbonded_method_to_custom(
-            self._nonbonded_method)
-
-        total_sterics_energy = "U_sterics;" + sterics_energy_expression + sterics_mixing_rules
-
+        # Create new CustomNonbondedForce for soft-core potential
         sterics_custom_nonbonded_force = openmm.CustomNonbondedForce(
             total_sterics_energy)
-        # Match cutoff from non-custom NB forces
+        
+        # Match cutoff from non-custom nonbonded forces
         sterics_custom_nonbonded_force.setCutoffDistance(r_cutoff)
 
-        if self._softcore_LJ_v2:
-            sterics_custom_nonbonded_force.addGlobalParameter(
-                "softcore_alpha", self._softcore_LJ_v2_alpha)
+        # Define Global and PerParticle parameters for soft-core potential 
+
+        # Use custom potential for vdW and related soft-core potential
+        if self._use_custom_vdw:
+            # Add global and local parameters
+            sterics_custom_nonbonded_force = self._add_custom_vdw_softcore_params(sterics_custom_nonbonded_force)
+
+        # or use standard OpenFE setup
         else:
-            sterics_custom_nonbonded_force.addGlobalParameter(
-                "softcore_alpha", self._softcore_alpha)
+            # Add global parametrs
+            if self._softcore_LJ_v2:
+                sterics_custom_nonbonded_force.addGlobalParameter(
+                    "softcore_alpha", self._softcore_LJ_v2_alpha)
+            else:
+                sterics_custom_nonbonded_force.addGlobalParameter(
+                    "softcore_alpha", self._softcore_alpha) 
+            # Add local parameters
+            # Lennard-Jones sigma initial
+            sterics_custom_nonbonded_force.addPerParticleParameter("sigmaA")
+            # Lennard-Jones epsilon initial
+            sterics_custom_nonbonded_force.addPerParticleParameter("epsilonA")
+            # Lennard-Jones sigma final
+            sterics_custom_nonbonded_force.addPerParticleParameter("sigmaB")
+            # Lennard-Jones epsilon final
+            sterics_custom_nonbonded_force.addPerParticleParameter("epsilonB")
+            # 1 = hybrid old atom, 0 otherwise
+            sterics_custom_nonbonded_force.addPerParticleParameter("unique_old")
+            # 1 = hybrid new atom, 0 otherwise
+            sterics_custom_nonbonded_force.addPerParticleParameter("unique_new")
 
-        # Lennard-Jones sigma initial
-        sterics_custom_nonbonded_force.addPerParticleParameter("sigmaA")
-        # Lennard-Jones epsilon initial
-        sterics_custom_nonbonded_force.addPerParticleParameter("epsilonA")
-        # Lennard-Jones sigma final
-        sterics_custom_nonbonded_force.addPerParticleParameter("sigmaB")
-        # Lennard-Jones epsilon final
-        sterics_custom_nonbonded_force.addPerParticleParameter("epsilonB")
-        # 1 = hybrid old atom, 0 otherwise
-        sterics_custom_nonbonded_force.addPerParticleParameter("unique_old")
-        # 1 = hybrid new atom, 0 otherwise
-        sterics_custom_nonbonded_force.addPerParticleParameter("unique_new")
-
+        # Add lambda parameters as global parameters of soft-core potential
         sterics_custom_nonbonded_force.addGlobalParameter(
             "lambda_sterics_core", 0.0)
-        sterics_custom_nonbonded_force.addGlobalParameter(
+        sterics_custom_nonbonded_force.addGlobalParameter( 
             "lambda_electrostatics_core", 0.0)
         sterics_custom_nonbonded_force.addGlobalParameter(
             "lambda_sterics_insert", 0.0)
         sterics_custom_nonbonded_force.addGlobalParameter(
             "lambda_sterics_delete", 0.0)
 
+        # Set NonbondedMethod of soft-core potential
         sterics_custom_nonbonded_force.setNonbondedMethod(
             custom_nonbonded_method)
 
+        # Add soft-core force as core_sterics_force to the system forces
         self._hybrid_system.addForce(sterics_custom_nonbonded_force)
         self._hybrid_system_forces['core_sterics_force'] = sterics_custom_nonbonded_force
 
-        # Set the use of dispersion correction to be the same between the new
-        # nonbonded force and the old one:
+        # Set the use of dispersion correction to be the same between the new nonbonded force and the old one
         if self._old_system_forces['NonbondedForce'].getUseDispersionCorrection():
+            # Set use of dispersion correction for NonbondedForce
             self._hybrid_system_forces['standard_nonbonded_force'].setUseDispersionCorrection(True)
+            # Set use of dispersion correlation for soft-core (_use_dispersion_correction is an input param)
             if self._use_dispersion_correction:
                 sterics_custom_nonbonded_force.setUseLongRangeCorrection(True)
         else:
             self._hybrid_system_forces['standard_nonbonded_force'].setUseDispersionCorrection(False)
+            sterics_custom_nonbonded_force.setUseLongRangeCorrection(False) 
 
+        # Set the use of a switching function to be the same between the new nonbonded force and the old one
         if self._old_system_forces['NonbondedForce'].getUseSwitchingFunction():
             switching_distance = self._old_system_forces['NonbondedForce'].getSwitchingDistance()
             standard_nonbonded_force.setUseSwitchingFunction(True)
@@ -1671,11 +1835,23 @@ class HybridTopologyFactory:
         """
         Handle the nonbonded interactions defined in the new and old systems.
 
-        TODO
+        Loop over particles in hybrid system and set forces, incl. parameters,
+        for all particles. Forces are evaluated with different potentials
+        depending on the atom group (unique, core, environment).
+
+        TODO 
         ----
         * Expand this docstring to explain the logic.
         * A lot of this logic is duplicated, probably turn it into a couple of
           functions.
+        
+        We have not changed the way that parameters are set for core_sterics_force, because the DE potential 
+        uses sigma and epsilon in the same way as the LJ soft-core, so the original OpenFE code should work with
+        the new definition of core_sterics_force. However, this should be changed for custom potentials
+        that use either other per-particle parameters or for which parameters were not defined in the same order.
+        So, our implementation only works for custom vdW potentials that use sigma and epsilon as parameters and 
+        that define the parameters in the same order as we have done in the various funcions above. 
+        ----
         """
         def _check_indices(idx1, idx2):
             if idx1 != idx2:
@@ -1683,10 +1859,15 @@ class HybridTopologyFactory:
                           "system")
                 raise ValueError(errmsg)
 
-        old_system_nonbonded_force = self._old_system_forces['NonbondedForce']
+        old_system_nonbonded_force = self._old_system_forces['NonbondedForce'] 
         new_system_nonbonded_force = self._new_system_forces['NonbondedForce']
         hybrid_to_old_map = self._hybrid_to_old_map
         hybrid_to_new_map = self._hybrid_to_new_map
+
+        # If using a custom force field for vdW interactions, we need to get sigma and epsilon from there 
+        if self._use_custom_vdw:
+            old_system_custom_nonbonded_force = self._old_system_forces['CustomNonbondedForce'] 
+            new_system_custom_nonbonded_force = self._new_system_forces['CustomNonbondedForce']
 
         # Define new global parameters for NonbondedForce
         self._hybrid_system_forces['standard_nonbonded_force'].addGlobalParameter('lambda_electrostatics_core', 0.0)
@@ -1694,25 +1875,32 @@ class HybridTopologyFactory:
         self._hybrid_system_forces['standard_nonbonded_force'].addGlobalParameter("lambda_electrostatics_delete", 0.0)
         self._hybrid_system_forces['standard_nonbonded_force'].addGlobalParameter("lambda_electrostatics_insert", 0.0)
 
-        # We have to loop through the particles in the system, because
-        # nonbonded force does not accept index
+        # We have to loop through the particles in the system, because nonbonded force does not accept index
         for particle_index in range(self._hybrid_system.getNumParticles()):
 
+            # Set parameters of particle if particle is unique to old system
             if particle_index in self._atom_classes['unique_old_atoms']:
+
                 # Get the parameters in the old system
                 old_index = hybrid_to_old_map[particle_index]
-                [charge, sigma, epsilon] = old_system_nonbonded_force.getParticleParameters(old_index)
 
-                # Add the particle to the hybrid custom sterics and
-                # electrostatics.
-                # turning off sterics in forward direction
-                check_index = self._hybrid_system_forces['core_sterics_force'].addParticle(
-                    [sigma, epsilon, sigma, 0.0*epsilon, 1, 0]
-                )
+                # If a custom nonbonded force for vdW inteactions is used, get sigma and epsilon from the custom force
+                if self._use_custom_vdw:
+                    [charge, _, _] = old_system_nonbonded_force.getParticleParameters(old_index)
+                    (sigma, epsilon) = old_system_custom_nonbonded_force.getParticleParameters(old_index)
+                else:
+                    [charge, sigma, epsilon] = old_system_nonbonded_force.getParticleParameters(old_index)  
+                                                                                                        
+                # Add the particle to the hybrid custom sterics and electrostatics, turning off sterics in forward direction
+                # We here add the soft-core force, which should go towards 0 when moving to the new state
+                check_index = self._hybrid_system_forces['core_sterics_force'].addParticle(      
+                    [sigma, epsilon, sigma, 0.0*epsilon, 1, 0]                                   
+                )                                                                                 
                 _check_indices(particle_index, check_index)
 
                 # Add particle to the regular nonbonded force, but
                 # Lennard-Jones will be handled by CustomNonbondedForce
+                # Regular nonbonded handles only electrostatics. 
                 check_index = self._hybrid_system_forces['standard_nonbonded_force'].addParticle(
                     charge, sigma, 0.0*epsilon
                 )
@@ -1722,25 +1910,34 @@ class HybridTopologyFactory:
                 # lambda_electrostatics_delete = 0, on at
                 # lambda_electrostatics_delete = 1; kill charge with
                 # lambda_electrostatics_delete = 0 --> 1
-                self._hybrid_system_forces['standard_nonbonded_force'].addParticleParameterOffset(
+                # We need to do this for the electrostatics, because we have not set up the interpolation 
+                # with lambda explicitely in the potential, like we have for the soft-core
+                self._hybrid_system_forces['standard_nonbonded_force'].addParticleParameterOffset(  
                     'lambda_electrostatics_delete', particle_index,
                     -charge, 0*sigma, 0*epsilon
                 )
 
+            # Set parameters of particle if particle is unique to new system
             elif particle_index in self._atom_classes['unique_new_atoms']:
+
                 # Get the parameters in the new system
                 new_index = hybrid_to_new_map[particle_index]
-                [charge, sigma, epsilon] = new_system_nonbonded_force.getParticleParameters(new_index)
 
-                # Add the particle to the hybrid custom sterics and electrostatics
-                # turning on sterics in forward direction
+                # If a custom nonbonded force for vdW inteactions is used, get sigma and epsilon from the custom force
+                if self._use_custom_vdw:
+                    [charge, _, _] = new_system_nonbonded_force.getParticleParameters(new_index)
+                    (sigma, epsilon) = new_system_custom_nonbonded_force.getParticleParameters(new_index)
+                else:
+                    [charge, sigma, epsilon] = new_system_nonbonded_force.getParticleParameters(new_index)  
+
+                # Add the particle to the hybrid custom sterics and electrostatics turning on sterics in forward direction
                 check_index = self._hybrid_system_forces['core_sterics_force'].addParticle(
                     [sigma, 0.0*epsilon, sigma, epsilon, 0, 1]
                 )
                 _check_indices(particle_index, check_index)
 
-                # Add particle to the regular nonbonded force, but
-                # Lennard-Jones will be handled by CustomNonbondedForce
+                # Add particle to the regular nonbonded force, but Lennard-Jones will be handled by CustomNonbondedForce
+                # Regular nonbonded handles only electrostatics. 
                 check_index = self._hybrid_system_forces['standard_nonbonded_force'].addParticle(
                     0.0, sigma, 0.0
                 )  # charge starts at zero
@@ -1754,12 +1951,22 @@ class HybridTopologyFactory:
                     +charge, 0, 0
                 )
 
+            # Set parameters of particle if particle is core, present in both old and new systems and changes
             elif particle_index in self._atom_classes['core_atoms']:
-                # Get the parameters in the new and old systems:
+
+                # Get the parameters in the new and old systems
                 old_index = hybrid_to_old_map[particle_index]
-                [charge_old, sigma_old, epsilon_old] = old_system_nonbonded_force.getParticleParameters(old_index)
                 new_index = hybrid_to_new_map[particle_index]
-                [charge_new, sigma_new, epsilon_new] = new_system_nonbonded_force.getParticleParameters(new_index)
+
+                # If a custom nonbonded force for vdW inteactions is used, get sigma and epsilon from the custom force
+                if self._use_custom_vdw:
+                    [charge_old, _, _] = old_system_nonbonded_force.getParticleParameters(old_index)
+                    (sigma_old, epsilon_old) = old_system_custom_nonbonded_force.getParticleParameters(old_index)
+                    [charge_new, _, _] = new_system_nonbonded_force.getParticleParameters(new_index)
+                    (sigma_new, epsilon_new) = new_system_custom_nonbonded_force.getParticleParameters(new_index)
+                else:
+                    [charge_old, sigma_old, epsilon_old] = old_system_nonbonded_force.getParticleParameters(old_index)
+                    [charge_new, sigma_new, epsilon_new] = new_system_nonbonded_force.getParticleParameters(new_index)
 
                 # Add the particle to the custom forces, interpolating between
                 # the two parameters; add steric params and zero electrostatics
@@ -1769,17 +1976,13 @@ class HybridTopologyFactory:
                 _check_indices(particle_index, check_index)
 
                 # Still add the particle to the regular nonbonded force, but
-                # with zeroed out parameters; add old charge to
-                # standard_nonbonded and zero sterics
+                # with zeroed out parameters; add old charge to standard_nonbonded and zero sterics
+                # Why interpolation of sigma?
                 check_index = self._hybrid_system_forces['standard_nonbonded_force'].addParticle(
                     charge_old, 0.5*(sigma_old+sigma_new), 0.0)
                 _check_indices(particle_index, check_index)
 
-                # Charge is charge_old at lambda_electrostatics = 0,
-                # charge_new at lambda_electrostatics = 1
-                # TODO: We could also interpolate the Lennard-Jones here
-                # instead of core_sterics force so that core_sterics_force
-                # could just be softcore.
+                # Charge is charge_old at lambda_electrostatics = 0, charge_new at lambda_electrostatics = 1
 
                 # Interpolate between old and new charge with
                 # lambda_electrostatics core make sure to keep sterics off
@@ -1790,39 +1993,50 @@ class HybridTopologyFactory:
 
             # Otherwise, the particle is in the environment
             else:
-                # The parameters will be the same in new and old system, so
-                # just take the old parameters
-                old_index = hybrid_to_old_map[particle_index]
-                [charge, sigma, epsilon] = old_system_nonbonded_force.getParticleParameters(old_index)
 
-                # Add the particle to the hybrid custom sterics, but they dont
-                # change; electrostatics are ignored
-                self._hybrid_system_forces['core_sterics_force'].addParticle(
+                # The parameters will be the same in new and old system, so just take the old parameters
+                old_index = hybrid_to_old_map[particle_index]
+
+                # If a custom nonbonded force for vdW inteactions is used, get sigma and epsilon from the custom force
+                if self._use_custom_vdw:
+                    [charge, _, _] = old_system_nonbonded_force.getParticleParameters(old_index)
+                    (sigma, epsilon) = old_system_custom_nonbonded_force.getParticleParameters(old_index)
+                else:
+                    [charge, sigma, epsilon] = old_system_nonbonded_force.getParticleParameters(old_index)  
+
+                # Add the particle to the hybrid custom sterics, but they dont change; electrostatics are ignored
+                # Use soft-core potential, which should be equal to the regular vdW when sigma and epsilon are constant and no atoms are of type unique
+                self._hybrid_system_forces['core_sterics_force'].addParticle(    
                     [sigma, epsilon, sigma, epsilon, 0, 0]
                 )
 
-                # Add the environment atoms to the regular nonbonded force as
-                # well: should we be adding steric terms here, too?
-                self._hybrid_system_forces['standard_nonbonded_force'].addParticle(
-                    charge, sigma, epsilon
-                )
+                # Add the environment atoms to the regular nonbonded force as well
+                # Why is epsilon not zero in the original OpenFE implementation here? 
+                # Because the epsilon of unique and core atoms are all set to 0, so env can only interact with env
+                # through the interactions that are defined here
+                if self._use_custom_vdw:
+                    self._hybrid_system_forces['standard_nonbonded_force'].addParticle(      
+                        charge, sigma, epsilon*0.0                                                     
+                    )                                                                      
 
+                else:                                                                        
+                    self._hybrid_system_forces['standard_nonbonded_force'].addParticle(        
+                        charge, sigma, epsilon                                               
+                    )                                                                                                                                           
+        
         # Now loop pairwise through (unique_old, unique_new) and add exceptions
-        # so that they never interact electrostatically
-        # (place into Nonbonded Force)
+        # so that they never interact electrostatically 
         unique_old_atoms = self._atom_classes['unique_old_atoms']
         unique_new_atoms = self._atom_classes['unique_new_atoms']
-
         for old in unique_old_atoms:
             for new in unique_new_atoms:
                 self._hybrid_system_forces['standard_nonbonded_force'].addException(
                     old, new, 0.0*unit.elementary_charge**2,
                     1.0*unit.nanometers, 0.0*unit.kilojoules_per_mole)
-                # This is only necessary to avoid the 'All forces must have
-                # identical exclusions' rule
-                self._hybrid_system_forces['core_sterics_force'].addExclusion(old, new)
+                self._hybrid_system_forces['core_sterics_force'].addExclusion(old, new)  
 
-        self._handle_interaction_groups()
+        if not self._use_custom_vdw:
+            self._handle_interaction_groups()
 
         self._handle_hybrid_exceptions()
 
@@ -1839,14 +2053,13 @@ class HybridTopologyFactory:
         4) Unique-new - environment
         5) Core - environment
         6) Core - core
+        7) Unique-old - unique-old
+        8) Unique-new - unique-new
 
-        Unique-old and Unique new are prevented from interacting this way,
+        Unique-old and Unique-new are prevented from interacting this way,
         and intra-unique interactions occur in an unmodified nonbonded force.
 
-        Must be called after particles are added to the Nonbonded forces
-        TODO: we should also be adding the following interaction groups...
-        7) Unique-new - Unique-new
-        8) Unique-old - Unique-old
+        Must be called after particles are added to the Nonbonded forces. 
         """
         # Get the force objects for convenience:
         sterics_custom_force = self._hybrid_system_forces['core_sterics_force']
@@ -1857,26 +2070,15 @@ class HybridTopologyFactory:
         unique_new_atoms = self._atom_classes['unique_new_atoms']
         environment_atoms = self._atom_classes['environment_atoms']
 
-        sterics_custom_force.addInteractionGroup(unique_old_atoms, core_atoms)
-
-        sterics_custom_force.addInteractionGroup(unique_old_atoms,
-                                                 environment_atoms)
-
-        sterics_custom_force.addInteractionGroup(unique_new_atoms,
-                                                 core_atoms)
-
-        sterics_custom_force.addInteractionGroup(unique_new_atoms,
-                                                 environment_atoms)
-
-        sterics_custom_force.addInteractionGroup(core_atoms, environment_atoms)
-
-        sterics_custom_force.addInteractionGroup(core_atoms, core_atoms)
-
-        sterics_custom_force.addInteractionGroup(unique_new_atoms,
-                                                 unique_new_atoms)
-
-        sterics_custom_force.addInteractionGroup(unique_old_atoms,
-                                                 unique_old_atoms)
+        # this is all to exclude unique_old, unique_new
+        sterics_custom_force.addInteractionGroup(unique_old_atoms,core_atoms)
+        sterics_custom_force.addInteractionGroup(unique_old_atoms,environment_atoms)
+        sterics_custom_force.addInteractionGroup(unique_new_atoms,core_atoms)
+        sterics_custom_force.addInteractionGroup(unique_new_atoms,environment_atoms)
+        sterics_custom_force.addInteractionGroup(core_atoms,environment_atoms)
+        sterics_custom_force.addInteractionGroup(core_atoms,core_atoms)
+        sterics_custom_force.addInteractionGroup(unique_new_atoms,unique_new_atoms)
+        sterics_custom_force.addInteractionGroup(unique_old_atoms,unique_old_atoms)
 
     def _handle_hybrid_exceptions(self):
         """
@@ -2347,6 +2549,87 @@ class HybridTopologyFactory:
                         index1_hybrid, index2_hybrid,
                         [chargeProd_new, sigma_new, epsilon_new*0.0,
                          sigma_new, epsilon_new, 0, 1]
+                    )
+
+    def _interpolate_electrostatic_exceptions(self):
+        """
+        Find the exceptions associated with old-old and old-core interactions,
+        as well as new-new and new-core interactions. Theses exceptions will
+        be placed in CustomBondedForce that will interpolate electrostatics.
+        The double exponential potential doesn't use exceptions for 14 interactions,
+        so we do not set up exceptions for this potential (/the softcore potential).
+        """
+
+        # define electrostatic potential as function of lambdas and exception chargeProd
+        old_new_nonbonded_exceptions = "U_electrostatics;"
+        old_new_nonbonded_exceptions += "U_electrostatics = (lambda_electrostatics_insert * unique_new + unique_old * (1 - lambda_electrostatics_delete)) * ONE_4PI_EPS0*chargeProd/r;"
+        old_new_nonbonded_exceptions += "ONE_4PI_EPS0 = %f;" % ONE_4PI_EPS0
+
+        # set up new force
+        nonbonded_exceptions_force = openmm.CustomBondForce(old_new_nonbonded_exceptions)
+        name = f"{nonbonded_exceptions_force.__class__.__name__}_exceptions"
+        nonbonded_exceptions_force.setName(name)
+        self._hybrid_system.addForce(nonbonded_exceptions_force)
+
+        # For reference, set name in force dict
+        self._hybrid_system_forces['old_new_exceptions_force'] = nonbonded_exceptions_force
+
+        # electrostatics insert
+        nonbonded_exceptions_force.addGlobalParameter(
+            "lambda_electrostatics_insert", 0.0
+        )
+        # electrostatics delete
+        nonbonded_exceptions_force.addGlobalParameter(
+            "lambda_electrostatics_delete", 0.0
+        )
+
+        for parameter in ['chargeProd','unique_old','unique_new']:
+            nonbonded_exceptions_force.addPerBondParameter(parameter)
+
+        # First, loop through the old system's exceptions and add them to the
+        # hybrid appropriately
+        for exception_pair, exception_parameters in self._old_system_exceptions.items():
+
+            [index1_old, index2_old] = exception_pair
+            [chargeProd_old, _, _] = exception_parameters
+
+            # Get hybrid indices
+            index1_hybrid = self._old_to_hybrid_map[index1_old]
+            index2_hybrid = self._old_to_hybrid_map[index2_old]
+            index_set = {index1_hybrid, index2_hybrid}
+
+            # Check if one of the atoms in the set is in the unique_old
+            if (len(index_set.intersection(self._atom_classes['unique_old_atoms'])) > 0 and
+                (chargeProd_old.value_in_unit_system(unit.md_unit_system) != 0.0)):
+                if self._interpolate_14s:
+                    # If we are interpolating 1,4s, then we anneal this term
+                    # off; otherwise, the exception force is constant and
+                    # already handled in the standard nonbonded force
+                    nonbonded_exceptions_force.addBond(
+                        index1_hybrid, index2_hybrid, [chargeProd_old, 1, 0]
+                    )
+
+        # Next, loop through the new system's exceptions and add them to the
+        # hybrid appropriately
+        for exception_pair, exception_parameters in self._new_system_exceptions.items():
+            [index1_new, index2_new] = exception_pair
+            [chargeProd_new, _, _] = exception_parameters
+
+            # Get hybrid indices:
+            index1_hybrid = self._new_to_hybrid_map[index1_new]
+            index2_hybrid = self._new_to_hybrid_map[index2_new]
+
+            index_set = {index1_hybrid, index2_hybrid}
+
+            # Check if one of the atoms in the set is in the unique_new
+            if (len(index_set.intersection(self._atom_classes['unique_new_atoms'])) > 0 and
+                (chargeProd_new.value_in_unit_system(unit.md_unit_system) != 0.0)):
+                if self._interpolate_14s:
+                    # If we are interpolating 1,4s, then we anneal this term
+                    # on; otherwise, the exception force is constant and
+                    # already handled in the standard nonbonded force
+                    nonbonded_exceptions_force.addBond(
+                        index1_hybrid, index2_hybrid, [chargeProd_new, 0, 1]
                     )
 
     def _compute_hybrid_positions(self):
