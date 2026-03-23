@@ -1,52 +1,41 @@
-[![Logo](https://img.shields.io/badge/OSMF-OpenFreeEnergy-%23002f4a)](https://openfree.energy/)
-[![build](https://github.com/OpenFreeEnergy/openfe/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/OpenFreeEnergy/openfe/actions/workflows/ci.yaml)
-[![coverage](https://codecov.io/gh/OpenFreeEnergy/openfe/branch/main/graph/badge.svg)](https://codecov.io/gh/OpenFreeEnergy/openfe)
-[![documentation](https://readthedocs.org/projects/openfe/badge/?version=stable)](https://docs.openfree.energy/en/stable/?badge=stable)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.8344248.svg)](https://doi.org/10.5281/zenodo.17258732)
+# Alchemical free energy calculations with custom potentials in OpenFE
 
+This is a fork of Open Free Energy's `openfe` package, which we have modified to calculate relative binding free energies (RBFEs) with our Garnet force field. 
 
-# `openfe` - A Python package for executing alchemical free energy calculations.
+## Introduction
 
-The `openfe` package is the flagship project of [Open Free Energy](https://openfree.energy),
-a pre competitive consortium aiming to provide robust, permissively licensed open source tools for molecular simulation in the drug discovery field.
+Garnet is a graph neural network that assigns force field parameters for diverse molecules, incl. proteins and small molecules, using continuous atom typing [1]. We have shown that the Garnet force field can be used to estimate relative binding free energies (RBFEs) with alchemical free energy calculations [1].
 
-Using `openfe` you can easily plan and execute alchemical free energy calculations.
+We have modified the `openfe` RBFE protocol to be Garnet-compatible. Our adaption follows OpenFE’s RBFE protocol closely, but substitutes the Lennard-Jones potential and the Gapsys soft-core potential with a double exponential potential and a related soft-core potential. These modifications are necessary, since Garnet was trained to predict force field parameters for the double exponential potential. 
 
-See our [website](https://openfree.energy/) for more information on the project,
-[try for yourself](https://try.openfree.energy) from the comfort of your browser,
-and we have [documentation on using the package](https://docs.openfree.energy/en/latest/index.html).
+OpenFE’s RFBE protocol can be run by following a few steps and requires minimal user intervention, aside from protein and ligand structure preparation. We provide instructions for running RBFE calculations with Garnet using our `openfe` fork at: 
+https://github.com/greener-group/garnet/tree/main/validation/rbfe/README.md
 
-## License
+We refer to the OpenFE GitHub [2], documentation [3] and Industry Benchmarking Project paper [4,5] for details on the code and its execution. 
 
-This library is made available under the [MIT](https://opensource.org/licenses/MIT) open source license.
-
-## Install
-
-### Latest release
-
-The latest release of `openfe` can be installed via `mamba`, `docker`, or a `single file installer`. See [our installation instructions](https://docs.openfree.energy/en/stable/installation.html) for more details.
-Dependencies can be installed via conda through:
-
-### Development version
-
-The development version of `openfe` can be installed directly from the `main` branch of this repository.
-
-First install the package dependencies using `mamba`:
-
-```bash
-mamba env create -f environment.yml
-```
-
-The openfe library can then be installed via:
+## Installation
 
 ```
+git clone https://github.com/greener-group/openfe.git
+cd openfe
+conda env create -f environment.yml
+conda activate openfe_garnet
 python -m pip install --no-deps .
 ```
 
-## Authors
+## Notes
 
-The OpenFE development team.
+- We are currently running `openfe-v1.8.0`.
+- You should be using the code on the branch `custom_potentials`, which is the default.
 
-## Acknowledgements
+## References
 
-OpenFE is an [Open Molecular Software Foundation](https://omsf.io/) hosted project.
+1. Garnet paper: Blanco-González, Schulze, Rovers, Greener. Training a force field for proteins and small molecules from scratch. arXiv. 2026. DOI: https://doi.org/10.48550/arXiv.2603.16770
+
+2. OpenFE GitHub: https://github.com/OpenFreeEnergy/openfe
+
+3. OpenFE documentation: https://docs.openfree.energy/en/latest/
+
+4. OpenFE Industry Benchmarking Project paper: Baumann, Horton, Henry, et al. Large-scale collaborative assessment of binding free energy calculations for drug discovery using OpenFE. ChemRxiv. 18 December 2025. DOI: https://doi.org/10.26434/chemrxiv-2025-7sthd
+
+5. OpenFE Industry Benchmarking Project GitHub: OpenFE Industry Benchmarking Project Github: https://github.com/OpenFreeEnergy/IndustryBenchmarks2024
